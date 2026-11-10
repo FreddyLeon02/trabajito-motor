@@ -1,0 +1,310 @@
+# Arma los instaladores de Trabajito Motor en computadoras de GitHub, los prueba como los usaría una
+# persona y, si se pide, los sube a Releases:
+#   - Mac: un .dmg universal (Apple Silicon e Intel). Se arma y se prueba en macOS 15 (Apple Silicon)
+#     y se prueba también en macOS 26 (Apple Silicon) y en macOS 15 (Intel).
+#   - Windows: el .exe. Se arma y se prueba en Windows Server 2025 y se prueba también en Windows 11 ARM.
+# Es gratis: GitHub no cobra las Actions de un repositorio público (computadoras estándar).
+# El código sale del repo PRIVADO FreddyLeon02/trabajito-motor-codigo, una copia de motor-whatsapp/ de
+# trabajito-admin que se actualiza con ci/subir-codigo.sh. Se lee con una llave de SOLO LECTURA (secreto
+# CODIGO_MOTOR_SSH). Los logs y los artefactos de este repo los puede ver cualquiera con cuenta de GitHub:
+# no se imprime el código ni las claves, y los artefactos duran 1 día. Más en ci/LEEME.md.
+name: Armar instaladores
+
+on:
+  workflow_dispatch:
+    inputs:
+      rama:
+        description: Rama del código (la copia de motor-whatsapp en trabajito-motor-codigo)
+        type: choice
+        options:
+          - dev
+          - main
+        default: dev
+      entornos:
+        description: Instaladores de qué entorno
+        type: choice
+        options:
+          - prod y dev
+          - prod
+          - dev
+        default: prod y dev
+      sistemas:
+        description: Para qué sistemas
+        type: choice
+        options:
+          - mac y windows
+          - mac
+          - windows
+        default: mac y windows
+      publicar:
+        description: Si pasan el armado y las pruebas, subir a Releases los que falten (nunca reemplaza uno ya publicado)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: armar-instaladores
+  cancel-in-progress: false
+
+env:
+  ENTORNOS: ${{ inputs.entornos }}
+
+jobs:
+  # Un solo commit para todos: Mac y Windows se arman del mismo código aunque la rama avance, y un
+  # «Re-run failed jobs» reutiliza este resultado.
+  commit:
+    name: Fijar el commit del código
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.fijar.outputs.sha }}
+    steps:
+      - name: Código del motor (repo privado, solo lectura)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: FreddyLeon02/trabajito-motor-codigo
+          ref: refs/heads/${{ inputs.rama }}
+          ssh-key: ${{ secrets.CODIGO_MOTOR_SSH }}
+          persist-credentials: false
+          path: codigo
+
+      - name: Fijar el commit
+        id: fijar
+        env:
+          RAMA: ${{ inputs.rama }}
+        run: |
+          sha="$(git -C codigo rev-parse HEAD)"
+          origen="$(sed -n 's/^commit: //p' codigo/ORIGEN.txt | tr -d '\r')"
+          echo "sha=${sha}" >>"$GITHUB_OUTPUT"
+          echo "Copia ${sha:0:7} (rama ${RAMA}): motor-whatsapp de trabajito-admin@${origen:0:7}."
+          echo "- Código: copia \`${sha:0:7}\` (rama ${RAMA}) de trabajito-admin@\`${origen:0:7}\`." >>"$GITHUB_STEP_SUMMARY"
+
+  mac:
+    name: Mac · armar y probar (macOS 15, Apple Silicon)
+    needs: commit
+    if: inputs.sistemas != 'windows'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Scripts de armado (este repo)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci-repo
+          persist-credentials: false
+
+      - name: Código del motor (repo privado, solo lectura)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: FreddyLeon02/trabajito-motor-codigo
+          ref: ${{ needs.commit.outputs.sha }}
+          ssh-key: ${{ secrets.CODIGO_MOTOR_SSH }}
+          persist-credentials: false
+          path: codigo
+
+      - name: Node 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: codigo/motor-whatsapp/package-lock.json
+
+      - name: Instalar dependencias
+        working-directory: codigo/motor-whatsapp
+        run: npm ci
+
+      # Con «publicar», una prueba que falla frena todo. Si no, queda como aviso.
+      - name: Pruebas automáticas del motor (en macOS)
+        id: pruebas
+        continue-on-error: ${{ !inputs.publicar }}
+        timeout-minutes: 10
+        working-directory: codigo/motor-whatsapp
+        run: npm run build && node --test --test-reporter=dot "dist/test/*.test.js"
+
+      - name: Armar los .dmg y probarlos en esta Mac
+        run: |
+          . ci-repo/ci/comun.sh
+          for entorno in $(entornos_de "$ENTORNOS"); do
+            bash ci-repo/ci/armar.sh mac "$entorno"
+            bash ci-repo/ci/mac/probar-dmg.sh "$entorno"
+          done
+
+      - name: Aviso si las pruebas del motor fallaron en macOS
+        if: steps.pruebas.outcome == 'failure'
+        run: echo "::warning::Las pruebas automáticas del motor fallaron en macOS. El .dmg igual se armó y se probó; revisa el paso «Pruebas automáticas del motor»."
+
+      - name: Guardar los .dmg
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mac
+          path: salida/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  probar-mac:
+    name: Mac · probar en ${{ matrix.nombre }}
+    needs: mac
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - maquina: macos-26
+            nombre: macOS 26 (Apple Silicon)
+          - maquina: macos-15-intel
+            nombre: macOS 15 (Intel)
+    runs-on: ${{ matrix.maquina }}
+    timeout-minutes: 30
+    steps:
+      - name: Scripts de armado (este repo)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci-repo
+          persist-credentials: false
+
+      - name: Bajar los .dmg recién armados
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mac
+          path: salida
+
+      - name: Instalarlos y probarlos en esta Mac
+        run: |
+          . ci-repo/ci/comun.sh
+          for entorno in $(entornos_de "$ENTORNOS"); do
+            bash ci-repo/ci/mac/probar-dmg.sh "$entorno"
+          done
+
+      - name: Guardar las capturas
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: capturas-${{ matrix.maquina }}
+          path: salida/*.png
+          retention-days: 1
+          if-no-files-found: ignore
+
+  windows:
+    name: Windows · armar y probar (Windows Server 2025)
+    needs: commit
+    if: inputs.sistemas != 'mac'
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Scripts de armado (este repo)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci-repo
+          persist-credentials: false
+
+      - name: Código del motor (repo privado, solo lectura)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: FreddyLeon02/trabajito-motor-codigo
+          ref: ${{ needs.commit.outputs.sha }}
+          ssh-key: ${{ secrets.CODIGO_MOTOR_SSH }}
+          persist-credentials: false
+          path: codigo
+
+      - name: Node 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: codigo/motor-whatsapp/package-lock.json
+
+      - name: Instalar dependencias
+        working-directory: codigo/motor-whatsapp
+        run: npm ci
+
+      - name: Armar los .exe y probarlos en esta computadora
+        run: |
+          . ci-repo/ci/comun.sh
+          for entorno in $(entornos_de "$ENTORNOS"); do
+            bash ci-repo/ci/armar.sh win "$entorno"
+            pwsh -NoProfile -File ci-repo/ci/windows/probar-instalador.ps1 -Entorno "$entorno"
+          done
+
+      - name: Guardar los .exe
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows
+          path: salida/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  # Informativo (continue-on-error): el .exe es de x64 y en Windows 11 ARM corre emulado.
+  probar-windows:
+    name: Windows · probar en Windows 11 ARM
+    needs: windows
+    runs-on: windows-11-arm
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - name: Scripts de armado (este repo)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci-repo
+          persist-credentials: false
+
+      - name: Bajar los .exe recién armados
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows
+          path: salida
+
+      - name: Instalarlos y probarlos en esta computadora
+        shell: pwsh
+        run: |
+          $lista = @{ 'prod y dev' = @('prod', 'dev'); 'prod' = @('prod'); 'dev' = @('dev') }[$env:ENTORNOS]
+          if (-not $lista) { throw "Entornos desconocidos: $env:ENTORNOS" }
+          foreach ($entorno in $lista) { & ./ci-repo/ci/windows/probar-instalador.ps1 -Entorno $entorno }
+
+      - name: Guardar las capturas
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: capturas-windows-11-arm
+          path: salida/*.png
+          retention-days: 1
+          if-no-files-found: ignore
+
+  publicar:
+    name: Publicar en Releases
+    needs: [commit, mac, probar-mac, windows, probar-windows]
+    # Un job que llega a su timeout-minutes termina «cancelled»: failure() no lo cuenta y cancelled()
+    # solo es true si se cancela la corrida entera. Por eso se exige 'success' en cada job obligatorio.
+    # probar-windows es informativo: se espera (está en needs), pero no se exige.
+    if: >-
+      inputs.publicar && !cancelled() && needs.commit.result == 'success' &&
+      (inputs.sistemas == 'windows' || (needs.mac.result == 'success' && needs.probar-mac.result == 'success')) &&
+      (inputs.sistemas == 'mac' || needs.windows.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Scripts de armado (este repo)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci-repo
+          persist-credentials: false
+
+      - name: Bajar los instaladores armados y probados
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "{mac,windows}"
+          merge-multiple: true
+          path: salida
+
+      - name: Subir los que falten
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SISTEMAS: ${{ inputs.sistemas }}
+        run: bash ci-repo/ci/publicar.sh salida

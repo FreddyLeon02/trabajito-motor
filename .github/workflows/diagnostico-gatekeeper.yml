@@ -1,0 +1,82 @@
+# Diagnóstico de lo que dice Gatekeeper del .dmg de Mac, con un control: una app mínima firmada igual
+# (ad hoc, sin notarizar) y las firmas de virus de XProtect (reglas YARA de Apple) pasadas sobre todos
+# los archivos de Trabajito Motor. Sirve para distinguir «falta notarizar» de «XProtect lo detecta».
+# Usa el artefacto «mac» de una corrida de «Armar instaladores» (dura 1 día).
+name: Diagnóstico de Gatekeeper (Mac)
+
+on:
+  workflow_dispatch:
+    inputs:
+      corrida:
+        description: Número de la corrida de «Armar instaladores» con el artefacto mac
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  gatekeeper:
+    name: Gatekeeper en ${{ matrix.maquina }}
+    strategy:
+      fail-fast: false
+      matrix:
+        maquina: [macos-15, macos-26]
+    runs-on: ${{ matrix.maquina }}
+    timeout-minutes: 20
+    steps:
+      - name: Bajar el .dmg de la corrida
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mac
+          path: salida
+          run-id: ${{ inputs.corrida }}
+          github-token: ${{ github.token }}
+
+      - name: Diagnóstico
+        run: |
+          set -u
+          marca_cuarentena() { xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;" "$1"; }
+          echo "== macOS $(sw_vers -productVersion) ($(uname -m))"
+          echo "== XProtect: $(defaults read /Library/Apple/System/Library/CoreServices/XProtect.bundle/Contents/Info CFBundleShortVersionString 2>/dev/null || echo '?')"
+
+          echo "== 1. CONTROL: una app mínima firmada ad hoc, sin notarizar (no es Trabajito Motor)"
+          mkdir -p /tmp/control/Hola.app/Contents/MacOS
+          printf '#include <stdio.h>\nint main(void) { puts("hola"); return 0; }\n' >/tmp/control/hola.c
+          clang -o /tmp/control/Hola.app/Contents/MacOS/Hola /tmp/control/hola.c
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleExecutable string Hola' -c 'Add :CFBundleIdentifier string bo.prueba.hola' \
+            -c 'Add :CFBundlePackageType string APPL' /tmp/control/Hola.app/Contents/Info.plist >/dev/null
+          codesign -s - --force /tmp/control/Hola.app
+          marca_cuarentena /tmp/control/Hola.app
+          syspolicy_check distribution /tmp/control/Hola.app 2>&1 | sed 's/^/  /' || true
+
+          echo "== 2. TRABAJITO MOTOR (del .dmg de PROD)"
+          punto="$(mktemp -d)/dmg"
+          mkdir -p "$punto" /tmp/motor
+          hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$punto" salida/Trabajito-Motor-mac.dmg >/dev/null
+          ditto "$punto/Trabajito Motor.app" "/tmp/motor/Trabajito Motor.app"
+          hdiutil detach "$punto" >/dev/null
+          marca_cuarentena "/tmp/motor/Trabajito Motor.app"
+          inicio="$(date '+%Y-%m-%d %H:%M:%S')"
+          syspolicy_check distribution "/tmp/motor/Trabajito Motor.app" 2>&1 | sed 's/^/  /' || true
+          echo "-- registro del sistema sobre XProtect durante ese chequeo:"
+          log show --start "$inicio" --style compact \
+            --predicate 'process == "syspolicyd" OR process == "XprotectService" OR process == "syspolicy_check" OR subsystem CONTAINS[c] "xprotect"' 2>/dev/null |
+            grep -i -E "xprotect|assessment|malware|yara|scan" | grep -v -i "lsregister" | head -40 | sed 's/^/  /' || true
+
+          echo "== 3. FIRMAS DE XPROTECT (YARA de Apple) sobre todos los archivos de la app"
+          reglas=/Library/Apple/System/Library/CoreServices/XProtect.bundle/Contents/Resources/XProtect.yara
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install yara >/dev/null 2>&1 || true
+          if command -v yara >/dev/null 2>&1 && [ -f "$reglas" ]; then
+            echo "Reglas: $(grep -c '^rule ' "$reglas") (XProtect.yara del sistema). Yara $(yara --version)."
+            coincidencias="$(yara -r -w "$reglas" "/tmp/motor/Trabajito Motor.app" 2>&1 || true)"
+            if [ -n "$coincidencias" ]; then
+              echo "COINCIDENCIAS:"; printf '%s\n' "$coincidencias" | head -40 | sed 's/^/  /'
+            else
+              echo "Ninguna firma de XProtect coincide con ningún archivo de la app."
+            fi
+            echo "-- control positivo: la misma herramienta sí lee las reglas (cuenta las que compila)"
+            yara -w "$reglas" /tmp/control/hola.c >/dev/null 2>&1 && echo "  las reglas compilan bien" || echo "  OJO: las reglas no compilaron con este yara"
+          else
+            echo "No pude correr YARA (yara: $(command -v yara || echo 'no está'); reglas: $([ -f "$reglas" ] && echo 'sí' || echo 'no'))."
+          fi

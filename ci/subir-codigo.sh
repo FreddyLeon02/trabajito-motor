@@ -34,12 +34,14 @@ echo "Origen: ${REPO_ORIGEN} ${rama} @ ${sha:0:7} (${fecha}) «${asunto}»"
 carpeta="$(mktemp -d)"
 trap 'rm -rf "$carpeta"' EXIT
 destino="${carpeta}/codigo"
-gh repo clone "$REPO_CODIGO" "$destino" -- --quiet 2>/dev/null || true
+# Los archivos tal cual están en trabajito-admin, sin convertir finales de línea, DESDE el clon: en Windows,
+# Git trae core.autocrlf=true y, si se apaga después de clonar, los archivos quedan con CRLF y «modificados»
+# (la segunda copia fallaba en `git rm` con «the following files have local modifications»).
+gh repo clone "$REPO_CODIGO" "$destino" -- --quiet --config core.autocrlf=false 2>/dev/null || true
 if [ ! -d "${destino}/.git" ]; then
   git init --quiet "$destino"
   git -C "$destino" remote add origin "https://github.com/${REPO_CODIGO}.git"
 fi
-# Los archivos tal cual están en trabajito-admin (sin convertir finales de línea).
 git -C "$destino" config core.autocrlf false
 if git -C "$destino" ls-remote --exit-code --heads origin "$rama" >/dev/null 2>&1; then
   git -C "$destino" fetch --quiet origin "$rama"
@@ -47,7 +49,8 @@ if git -C "$destino" ls-remote --exit-code --heads origin "$rama" >/dev/null 2>&
 else
   git -C "$destino" checkout --quiet --orphan "$rama"
 fi
-git -C "$destino" rm -r --quiet --ignore-unmatch . >/dev/null
+# Se reemplaza todo por lo de trabajito-admin: -f, porque este clon es temporal y nada de él se conserva.
+git -C "$destino" rm -r -f --quiet --ignore-unmatch . >/dev/null
 git -c core.autocrlf=false -C "$origen" archive "$sha" motor-whatsapp | tar -x -C "$destino"
 printf 'repo: %s\nrama: %s\ncommit: %s\nfecha: %s\nasunto: %s\n' "$REPO_ORIGEN" "$rama" "$sha" "$fecha" "$asunto" >"${destino}/ORIGEN.txt"
 git -C "$destino" add -A
